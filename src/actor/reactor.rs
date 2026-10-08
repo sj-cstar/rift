@@ -438,6 +438,11 @@ pub struct Reactor {
     /// Cross-display moves rift started that macOS may not have caught up with:
     /// window -> (target space, end of the grace period).
     in_flight_display_moves: HashMap<WindowServerId, (SpaceId, Instant)>,
+    /// Displays in the last snapshot that had any.
+    known_displays: HashSet<String>,
+    /// Displays that joined or left in a recent display change, and until when windows
+    /// moving onto or off them keep their workspace number.
+    settling_displays: HashMap<String, Instant>,
     /// Workspace display bindings need re-applying once the current event's
     /// outcome has settled window membership.
     bindings_need_check: bool,
@@ -452,6 +457,10 @@ pub struct Reactor {
 }
 
 impl Reactor {
+    /// How long a display change takes to settle. Until then a window moving onto or
+    /// off a display that joined or left keeps its workspace number: macOS, or the
+    /// app, can still move it between displays as the change completes.
+    const DISPLAY_CHANGE_SETTLE: Duration = Duration::from_secs(5);
     /// How long a window rift moved to another display is held there against reports
     /// of its old display. Those reports lag the move while macOS and the app catch up,
     /// and following them makes the window flip back and forth between displays.
@@ -584,6 +593,8 @@ impl Reactor {
             viewport_gesture: None,
             presentations: HashMap::default(),
             in_flight_display_moves: HashMap::default(),
+            known_displays: HashSet::default(),
+            settling_displays: HashMap::default(),
             bindings_need_check: false,
             #[cfg(test)]
             event_outcome_phase_trace: Vec::new(),
@@ -908,9 +919,11 @@ impl Reactor {
                 preserve_missing_assignments,
             ) {
                 if let Some(space) = target {
-                    let preserve_ordinal = self
-                        .assigned_space_for_window_id(wid)
-                        .is_some_and(|assigned| invalidated_spaces.contains(&assigned));
+                    let assigned = self.assigned_space_for_window_id(wid);
+                    let preserve_ordinal = assigned
+                        .is_some_and(|assigned| invalidated_spaces.contains(&assigned))
+                        || assigned.is_some_and(|assigned| self.display_change_settling(assigned))
+                        || self.display_change_settling(space);
                     self.reassign_window_to_authoritative_space(wid, space, preserve_ordinal);
                 } else {
                     self.send_layout_event(LayoutEvent::WindowRemoved(wid));
@@ -3281,6 +3294,20 @@ impl Reactor {
         self.refresh_display_bindings(&screens);
         self.space_state.active_window_spaces = active_window_spaces;
         self.space_state.membership_complete = membership_complete;
+        // Displays that joined or left since the last snapshot that had any. The first
+        // has nothing to compare with, and one without displays (sleep, a closed lid)
+        // keeps the comparison for when they return.
+        if !screens.is_empty() {
+            let current: HashSet<String> =
+                screens.iter().map(|screen| screen.display_uuid.clone()).collect();
+            if !self.known_displays.is_empty() {
+                let until = Instant::now() + Self::DISPLAY_CHANGE_SETTLE;
+                for display in self.known_displays.symmetric_difference(&current) {
+                    self.settling_displays.insert(display.clone(), until);
+                }
+            }
+            self.known_displays = current;
+        }
         let activation_config = self.activation_cfg();
         let topology_workflow::SpaceSnapshotAnalysis {
             spaces,
@@ -3729,6 +3756,13 @@ impl Reactor {
         self.state.windows.workspace_info_for_window(wid).map(|info| info.space)
     }
 
+    /// Whether `space`'s display joined or left in a display change still settling.
+    fn display_change_settling(&self, space: SpaceId) -> bool {
+        self.display_uuid_for_space(space)
+            .and_then(|display| self.settling_displays.get(&display))
+            .is_some_and(|until| Instant::now() < *until)
+    }
+
     /// Record that rift just moved `window` onto `target`'s display.
     fn note_display_move_in_flight(&mut self, window: WindowId, target: SpaceId) {
         if self.assigned_space_for_window_id(window) != Some(target) {
@@ -3891,12 +3925,16 @@ impl Reactor {
             })
             .collect();
         for (wid, authoritative_space) in windows {
-            // A window keeps its workspace number when its display went away, or when
-            // it is returning to the display its workspace is bound to.
-            let preserve_ordinal = self
-                .assigned_space_for_window_id(wid)
+            // A window keeps its workspace number when its display went away, when it
+            // is returning to the display its workspace is bound to, or when it moves
+            // onto or off a display that just joined or left, which macOS or the app
+            // can still be doing while the change settles.
+            let assigned = self.assigned_space_for_window_id(wid);
+            let preserve_ordinal = assigned
                 .is_some_and(|space| invalidated_spaces.contains(&space))
-                || self.window_returns_to_bound_display(wid, authoritative_space);
+                || self.window_returns_to_bound_display(wid, authoritative_space)
+                || assigned.is_some_and(|space| self.display_change_settling(space))
+                || self.display_change_settling(authoritative_space);
             self.reassign_window_to_authoritative_space(wid, authoritative_space, preserve_ordinal);
         }
     }
