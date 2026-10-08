@@ -66,6 +66,9 @@ impl Reactor {
             .expect("test window should have a WindowServer identity")
     }
 
+    /// End the settling period of the last display change, as time would.
+    pub fn settle_display_change_for_test(&mut self) { self.settling_displays.clear(); }
+
     /// End the grace period of every cross-display move rift started.
     pub fn expire_display_moves_for_test(&mut self) {
         let expired = std::time::Instant::now() - std::time::Duration::from_millis(1);
